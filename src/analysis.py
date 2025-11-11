@@ -1,23 +1,37 @@
+import random
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
+
+
+# ============================================
+# 🌍 Globals
+# ============================================
 
 
 SMALL_PATH = 'data/small.xlsx'
 MEDIUM_PATH = 'data/medium.xlsx'
 LARGE_PATH = 'data/large.xlsx'
 
+DELETED_SMALL_PATH = 'out/data_with_gaps/small'
+DELETED_MEDIUM_PATH = 'out/data_with_gaps/medium'
+DELETED_LARGE_PATH = 'out/data_with_gaps/large'
+
+PERCENTS_OF_GAPS = [0.03, 0.05, 0.1, 0.2, 0.3]
+
+
+# ============================================
+# 📄 Dataset class
+# ============================================
+
 
 class Dataset():
     def __init__(self, path: str):
-        self.df = self.load_data(path)
-        
+        self.df = self.load_data(path)       
         self.preprocess()
         
         
-    # ============================================
-    # 📦 Data loading & Preprocess
-    # ============================================
-        
+    #-------------Data Loading & Preprocess------------    
         
     def load_data(self, path: str) -> pd.DataFrame:
         try:
@@ -32,11 +46,8 @@ class Dataset():
         self.df['date-time'] = pd.to_datetime(self.df['date-time'])
         self.df['cards_number'] = self.df['cards_number'].astype(str)
         
-        
-    # ============================================
-    # 📊 Analysis & Diagrams
-    # ============================================
-    
+
+    #--------------Analysis & Diagrams---------------
     
     def count(self):
         df_count = pd.DataFrame()
@@ -172,7 +183,62 @@ class Dataset():
         plt.xlabel("Total cost")
         plt.ylabel("Number of rows")
         plt.show()
-    
-    
-data = Dataset(SMALL_PATH)
         
+        
+    #---------------------Make Gaps-----------------------
+        
+    def remove_blocks(self, percent: float=0.3, inplace: bool=True) -> pd.DataFrame:
+        if inplace:
+            df = self.df
+        else:
+            df = self.df.copy()
+        
+        rows, cols = df.shape
+        total_cells = rows * cols
+        target_remove = int(total_cells * percent)
+        
+        block_sizes = [(2, 2), (3, 3), (4, 4), (2, 3), (3, 2), (2, 4), (4, 2), (3, 4), (4, 3)]
+        
+        removed = 0
+        
+        while removed < target_remove:
+            block_h, block_w = random.choice(block_sizes)
+            
+            r = random.randint(0, rows - block_h)
+            c = random.randint(0, cols - block_w)
+            
+            for i in range(r, r + block_h):
+                for j in range(c, c + block_w):
+                    df.iat[i, j] = np.nan
+                    
+            removed += block_h * block_w
+                    
+        return df
+
+
+# ============================================
+# ⚙️ Global Functions
+# ============================================
+
+
+def create_data_with_gaps(data: dict[str, Dataset], percents: list[float]):
+    for p in percents:
+        deleted_small = data["small"].remove_blocks(percent=p, inplace=False)
+        deleted_medium = data["medium"].remove_blocks(percent=p, inplace=False)
+        deleted_large = data["large"].remove_blocks(percent=p, inplace=False)
+        
+        deleted_small.to_excel(f"{DELETED_SMALL_PATH}/{int(p*100)}.xlsx", index=False)
+        deleted_medium.to_excel(f"{DELETED_MEDIUM_PATH}/{int(p*100)}.xlsx", index=False)
+        deleted_large.to_excel(f"{DELETED_LARGE_PATH}/{int(p*100)}.xlsx", index=False)
+        
+        
+# ============================================
+# 📥 Loaded Data
+# ============================================
+
+
+data = {
+    "small": Dataset(SMALL_PATH),
+    "medium": Dataset(MEDIUM_PATH),
+    "large": Dataset(LARGE_PATH),
+}
