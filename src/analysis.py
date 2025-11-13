@@ -5,6 +5,18 @@ import matplotlib.pyplot as plt
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import defaultdict
 
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.preprocessing import StandardScaler
+
+import scipy.cluster.hierarchy as sch
+
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, FunctionTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import cross_val_score, KFold
+from sklearn.linear_model import LogisticRegression, LinearRegression
+
 
 # ============================================
 # 🌍 Globals
@@ -444,6 +456,207 @@ class Dataset():
             df["cards_number"] = df["cards_number"].astype("string").str.replace(r"\.0$", "", regex=True)
 
         return df
+    
+    
+    #------------Clusterization----------------
+    def hierarchical_clustering(
+        self,
+        features: list[str],
+        n_clusters: int | None = 3,
+        *,
+        linkage: str = "ward",                # "ward" | "complete" | "average" | "single"
+        metric: str = "euclidean",            # игнорируется для "ward" (всегда euclidean)
+        distance_threshold: float | None = None,
+        standardize: bool = True,
+        label_column: str | None = None,
+        plot: bool = True,
+        savefig_path: str | None = None,
+    ):
+        """
+        Агломеративная иерархическая кластеризация по выбранным числовым признакам.
+
+        Параметры:
+            features           : список колонок DataFrame для кластеризации (числовые).
+            n_clusters         : число кластеров; игнорируется, если задан distance_threshold.
+            linkage            : правило объединения кластеров.
+            metric             : метрика расстояния (для "ward" всегда "euclidean").
+            distance_threshold : порог высоты дендрограммы вместо фиксированного числа кластеров.
+            standardize        : стандартизировать ли признаки (StandardScaler).
+            label_column       : имя выходной колонки с метками кластеров в self.df.
+            plot               : рисовать дендрограмму.
+            savefig_path       : путь для сохранения графика (если нужен).
+
+        Возвращает:
+            (labels: pd.Series, model: AgglomerativeClustering)
+        """
+        # --- подготовка данных ---
+        X = self.df[features].dropna()
+        num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+        if not num_cols:
+            raise ValueError("Нужны числовые признаки для кластеризации.")
+        if len(num_cols) < len(X.columns):
+            X = X[num_cols]
+
+        X_values = X.values
+        if standardize:
+            X_values = StandardScaler().fit_transform(X_values)
+
+        # --- модель ---
+        effective_metric = "euclidean" if linkage == "ward" else metric
+        model = AgglomerativeClustering(
+            n_clusters=None if distance_threshold is not None else n_clusters,
+            linkage=linkage,
+            metric=effective_metric,
+            distance_threshold=distance_threshold,
+            compute_distances=distance_threshold is not None,
+        ).fit(X_values)
+
+        labels = pd.Series(model.labels_, index=X.index, name="cluster")
+
+        # --- запись меток в df ---
+        if label_column is None:
+            suffix = (
+                f"thr_{distance_threshold}"
+                if distance_threshold is not None
+                else f"{n_clusters}"
+            )
+            label_column = f"hclust_{linkage}_{suffix}"
+        self.df[label_column] = pd.Series(index=self.df.index, dtype="Int64")
+        self.df.loc[labels.index, label_column] = labels.values
+
+        # --- визуализация (дендрограмма) ---
+        if plot:
+            Z = sch.linkage(X_values, method=linkage, metric=effective_metric)
+            plt.figure(figsize=(10, 5))
+            sch.dendrogram(Z, no_labels=True)
+            plt.title("Hierarchical clustering dendrogram")
+            plt.xlabel("Objects")
+            plt.ylabel("Distance")
+            if savefig_path:
+                plt.tight_layout()
+                plt.savefig(savefig_path, dpi=150)
+            plt.show()
+
+        return labels, model
+    
+    
+    def add_feature_ranking(self, target):
+        import numpy as np
+        import pandas as pd
+        from pandas.api.types import (
+            is_object_dtype, is_string_dtype, is_bool_dtype,
+            is_numeric_dtype, is_integer_dtype, is_datetime64_any_dtype,
+            CategoricalDtype,
+        )
+        from sklearn.compose import ColumnTransformer
+        from sklearn.preprocessing import OneHotEncoder, FunctionTransformer, StandardScaler
+        from sklearn.impute import SimpleImputer
+        from sklearn.pipeline import Pipeline
+        from sklearn.model_selection import cross_val_score, KFold
+        from sklearn.linear_model import LinearRegression, RidgeClassifier
+        from sklearn.exceptions import ConvergenceWarning
+        import warnings
+
+        if not isinstance(target, str):
+            raise ValueError("target must be a column name (str)")
+        if target not in self.df.columns:
+            raise ValueError(f"target column '{target}' not found in dataset")
+
+        y = self.df[target]
+        X_full = self.df.drop(columns=[target])
+
+        def is_classification(series: pd.Series) -> bool:
+            if not is_numeric_dtype(series):
+                return True
+            nun = series.nunique(dropna=True)
+            if is_integer_dtype(series) and nun <= 12:
+                return True
+            if nun <= 6:
+                return True
+            return False
+
+        task_is_clf = is_classification(y)
+        scoring = "accuracy" if task_is_clf else "r2"
+        estimator = RidgeClassifier(alpha=1.0) if task_is_clf else LinearRegression()
+        cv = KFold(n_splits=5, shuffle=True, random_state=42)
+
+        idx = y.dropna().index
+        y = y.loc[idx]
+        X_full = X_full.loc[idx]
+
+        def build_preprocessor(cols: list[str]) -> ColumnTransformer:
+            sub = X_full[cols]
+            num_cols = [c for c in sub.columns if is_numeric_dtype(sub[c])]
+            cat_cols = [c for c in sub.columns if is_object_dtype(sub[c]) or is_string_dtype(sub[c]) or isinstance(sub[c].dtype, CategoricalDtype) or is_bool_dtype(sub[c])]
+            dt_cols = [c for c in sub.columns if is_datetime64_any_dtype(sub[c])]
+
+            def dt_to_parts(X: pd.DataFrame) -> pd.DataFrame:
+                X = X.copy()
+                out = pd.DataFrame(index=X.index)
+                for c in X.columns:
+                    s = pd.to_datetime(X[c], errors="coerce")
+                    out[f"{c}__year"] = s.dt.year.astype("float64")
+                    out[f"{c}__month"] = s.dt.month.astype("float64")
+                    out[f"{c}__day"] = s.dt.day.astype("float64")
+                    out[f"{c}__dow"] = s.dt.dayofweek.astype("float64")
+                return out
+
+            num_tr = Pipeline([
+                ("imp", SimpleImputer(strategy="median")),
+                ("sc", StandardScaler(with_mean=False)),
+            ])
+            cat_tr = Pipeline([
+                ("imp", SimpleImputer(strategy="most_frequent")),
+                ("ohe", OneHotEncoder(handle_unknown="ignore", sparse_output=True)),
+            ])
+            dt_tr = Pipeline([
+                ("parts", FunctionTransformer(dt_to_parts, validate=False)),
+                ("imp", SimpleImputer(strategy="median")),
+                ("sc", StandardScaler(with_mean=False)),
+            ])
+            transformers = []
+            if num_cols:
+                transformers.append(("num", num_tr, num_cols))
+            if cat_cols:
+                transformers.append(("cat", cat_tr, cat_cols))
+            if dt_cols:
+                transformers.append(("dt", dt_tr, dt_cols))
+            if not transformers:
+                raise ValueError("No usable columns in the current subset")
+            return ColumnTransformer(transformers)
+
+        selected: list[str] = []
+        remaining = list(X_full.columns)
+        results = []
+        prev_score = -np.inf
+
+        while remaining:
+            best_feat = None
+            best_score = -np.inf
+            for f in remaining:
+                cols = selected + [f]
+                pre = build_preprocessor(cols)
+                pipe = Pipeline([("prep", pre), ("est", estimator)])
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", category=ConvergenceWarning)
+                        score = float(cross_val_score(pipe, X_full[cols], y, cv=cv, scoring=scoring).mean())
+                except Exception:
+                    score = -np.inf
+                if score > best_score:
+                    best_score = score
+                    best_feat = f
+            selected.append(best_feat)
+            remaining.remove(best_feat)
+            results.append({
+                "feature": best_feat,
+                "step": len(selected),
+                "cv_score_after_add": best_score,
+                "delta": (best_score - prev_score) if np.isfinite(prev_score) else np.nan,
+            })
+            prev_score = best_score
+
+        return pd.DataFrame(results)
 
             
         
@@ -483,6 +696,36 @@ def recover_data_groups():
         for (dataset, p) in datasets:
             dataset_inputed = dataset.impute_zet(k=15)
             dataset_inputed.to_excel(f"out/recovered_zet/{size}/{p}.xlsx", index=False)
+            
+            
+def clustering_ward():
+    data = Dataset("out/recovered_groups/small/3.xlsx")
+    
+    labels, model = data.hierarchical_clustering(
+        features=["store_name", "date-time", "coordinates", "coordinates", "brands", "price", "cards_number", "number_of_products", "receipt_id", "total_cost"],
+        n_clusters=3,          # или distance_threshold=..., тогда n_clusters игнорируется
+        linkage="ward",        # "ward" | "complete" | "average" | "single"
+        metric="euclidean",    # для non-ward можно задать, напр. "cosine"
+        standardize=True,
+        label_column="cluster3",
+        plot=True,
+        savefig_path=None,
+    )
+    
+    
+def clustering_euclidian():
+    data = Dataset("out/recovered_groups/small/3.xlsx")
+    
+    labels, model = data.hierarchical_clustering(
+        features=["store_name", "date-time", "coordinates", "coordinates", "brands", "price", "cards_number", "number_of_products", "receipt_id", "total_cost"],
+        n_clusters=3,          # или distance_threshold=..., тогда n_clusters игнорируется
+        linkage="complete",        # "ward" | "complete" | "average" | "single"
+        metric="chebyshev",    # для non-ward можно задать, напр. "cosine"
+        standardize=True,
+        label_column="cluster3",
+        plot=True,
+        savefig_path=None,
+    )
         
         
 # ============================================
@@ -497,4 +740,8 @@ def recover_data_groups():
 # }
 
 if __name__ == "__main__":
-    recover_data_groups()
+    data = Dataset("out/recovered_groups/small/3.xlsx")
+    
+    rank = data.add_feature_ranking("categories")
+    
+    print(rank)
