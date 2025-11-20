@@ -10,12 +10,16 @@ from sklearn.preprocessing import StandardScaler
 
 import scipy.cluster.hierarchy as sch
 
+from sklearn.metrics import silhouette_score
+
+from sklearn.preprocessing import OneHotEncoder
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder, FunctionTransformer
-from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import cross_val_score, KFold
-from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.feature_selection import SequentialFeatureSelector
+from sklearn.model_selection import train_test_split
+
+from pandas.api.types import is_numeric_dtype
 
 
 # ============================================
@@ -73,6 +77,72 @@ class Dataset():
                 df_count[col] = [None, None, list(self.df[col].mode())[0]]
                 
         return df_count
+
+
+    def count_all(self):
+        df = self.df
+        result = {}
+
+        for col in df.columns:
+            s = df[col]
+
+            # выбрасываем NaN / NaT, чтобы не мешали подсчёту
+            s_no_na = s.dropna()
+
+            # если в колонке вообще нет значений после dropna
+            if s_no_na.empty:
+                result[col] = [np.nan, np.nan, np.nan]
+                continue
+
+            # Числовые признаки — считаем как обычно
+            if pd.api.types.is_numeric_dtype(s_no_na):
+                mean_val = s_no_na.mean()
+                median_val = s_no_na.median()
+                mode_series = s_no_na.mode()
+                mode_val = mode_series.iloc[0] if not mode_series.empty else np.nan
+
+            # Даты/время — переводим в int64 (наносекунды), считаем, переводим обратно
+            elif pd.api.types.is_datetime64_any_dtype(s_no_na):
+                # переводим в числа
+                numeric = s_no_na.view('int64')
+
+                mean_num = numeric.mean()
+                median_num = numeric.median()
+                mode_series = numeric.mode()
+                mode_num = mode_series.iloc[0] if not mode_series.empty else np.nan
+
+                # переводим обратно в datetime
+                mean_val = pd.to_datetime(mean_num)
+                median_val = pd.to_datetime(median_num)
+                mode_val = pd.to_datetime(mode_num) if not pd.isna(mode_num) else pd.NaT
+
+            else:
+                # Строки/категории: факторизуем (строго переводим в числа)
+                # factorize возвращает codes и массив уникальных значений
+                codes, uniques = pd.factorize(s_no_na, sort=True)
+                codes = pd.Series(codes, index=s_no_na.index)
+
+                # считаем среднее/медиану/моду по числовым кодам
+                mean_code = int(round(codes.mean()))
+                median_code = int(np.median(codes))
+                mode_code = int(codes.mode().iloc[0])
+
+                # ограничим индексы на всякий случай
+                max_idx = len(uniques) - 1
+                mean_code = min(max(mean_code, 0), max_idx)
+                median_code = min(max(median_code, 0), max_idx)
+                mode_code = min(max(mode_code, 0), max_idx)
+
+                # переводим коды обратно в признаки
+                mean_val = uniques[mean_code]
+                median_val = uniques[median_code]
+                mode_val = uniques[mode_code]
+
+            result[col] = [mean_val, median_val, mode_val]
+
+        df_count = pd.DataFrame(result, index=['mean', 'median', 'mode'])
+        return df_count
+
     
     
     def draw_hist_store(self):
@@ -459,6 +529,87 @@ class Dataset():
     
     
     #------------Clusterization----------------
+    # def hierarchical_clustering(
+    #     self,
+    #     features: list[str],
+    #     n_clusters: int | None = 3,
+    #     *,
+    #     linkage: str = "ward",                # "ward" | "complete" | "average" | "single"
+    #     metric: str = "euclidean",            # игнорируется для "ward" (всегда euclidean)
+    #     distance_threshold: float | None = None,
+    #     standardize: bool = True,
+    #     label_column: str | None = None,
+    #     plot: bool = True,
+    #     savefig_path: str | None = None,
+    # ):
+    #     """
+    #     Агломеративная иерархическая кластеризация по выбранным числовым признакам.
+
+    #     Параметры:
+    #         features           : список колонок DataFrame для кластеризации (числовые).
+    #         n_clusters         : число кластеров; игнорируется, если задан distance_threshold.
+    #         linkage            : правило объединения кластеров.
+    #         metric             : метрика расстояния (для "ward" всегда "euclidean").
+    #         distance_threshold : порог высоты дендрограммы вместо фиксированного числа кластеров.
+    #         standardize        : стандартизировать ли признаки (StandardScaler).
+    #         label_column       : имя выходной колонки с метками кластеров в self.df.
+    #         plot               : рисовать дендрограмму.
+    #         savefig_path       : путь для сохранения графика (если нужен).
+
+    #     Возвращает:
+    #         (labels: pd.Series, model: AgglomerativeClustering)
+    #     """
+    #     # --- подготовка данных ---
+    #     X = self.df[features].dropna()
+    #     num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+    #     if not num_cols:
+    #         raise ValueError("Нужны числовые признаки для кластеризации.")
+    #     if len(num_cols) < len(X.columns):
+    #         X = X[num_cols]
+
+    #     X_values = X.values
+    #     if standardize:
+    #         X_values = StandardScaler().fit_transform(X_values)
+
+    #     # --- модель ---
+    #     effective_metric = "euclidean" if linkage == "ward" else metric
+    #     model = AgglomerativeClustering(
+    #         n_clusters=None if distance_threshold is not None else n_clusters,
+    #         linkage=linkage,
+    #         metric=effective_metric,
+    #         distance_threshold=distance_threshold,
+    #         compute_distances=distance_threshold is not None,
+    #     ).fit(X_values)
+
+    #     labels = pd.Series(model.labels_, index=X.index, name="cluster")
+
+    #     # --- запись меток в df ---
+    #     if label_column is None:
+    #         suffix = (
+    #             f"thr_{distance_threshold}"
+    #             if distance_threshold is not None
+    #             else f"{n_clusters}"
+    #         )
+    #         label_column = f"hclust_{linkage}_{suffix}"
+    #     self.df[label_column] = pd.Series(index=self.df.index, dtype="Int64")
+    #     self.df.loc[labels.index, label_column] = labels.values
+
+    #     # --- визуализация (дендрограмма) ---
+    #     if plot:
+    #         Z = sch.linkage(X_values, method=linkage, metric=effective_metric)
+    #         plt.figure(figsize=(10, 5))
+    #         sch.dendrogram(Z, no_labels=True)
+    #         plt.title("Hierarchical clustering dendrogram")
+    #         plt.xlabel("Objects")
+    #         plt.ylabel("Distance")
+    #         if savefig_path:
+    #             plt.tight_layout()
+    #             plt.savefig(savefig_path, dpi=150)
+    #         plt.show()
+
+    #     return labels, model
+
+
     def hierarchical_clustering(
         self,
         features: list[str],
@@ -468,10 +619,14 @@ class Dataset():
         metric: str = "euclidean",            # игнорируется для "ward" (всегда euclidean)
         distance_threshold: float | None = None,
         standardize: bool = True,
-        label_column: str | None = None,
+        label_column: str | None = None,      # колонка для меток из AgglomerativeClustering
+        # --- НОВОЕ ---
+        cut_distance: float | None = None,    # высота отсечения дендрограммы, напр. 120
+        cut_label_column: str | None = None,  # колонка для меток при cut_distance
+        # -------------
         plot: bool = True,
         savefig_path: str | None = None,
-    ):
+        ):
         """
         Агломеративная иерархическая кластеризация по выбранным числовым признакам.
 
@@ -480,18 +635,21 @@ class Dataset():
             n_clusters         : число кластеров; игнорируется, если задан distance_threshold.
             linkage            : правило объединения кластеров.
             metric             : метрика расстояния (для "ward" всегда "euclidean").
-            distance_threshold : порог высоты дендрограммы вместо фиксированного числа кластеров.
+            distance_threshold : порог высоты в sklearn-кластере вместо фиксированного числа кластеров.
             standardize        : стандартизировать ли признаки (StandardScaler).
-            label_column       : имя выходной колонки с метками кластеров в self.df.
+            label_column       : имя выходной колонки с метками кластеров (sklearn) в self.df.
+            cut_distance       : уровень отсечения дендрограммы (по матрице Z, SciPy).
+            cut_label_column   : имя колонки с метками кластеров на уровне cut_distance.
             plot               : рисовать дендрограмму.
             savefig_path       : путь для сохранения графика (если нужен).
 
         Возвращает:
-            (labels: pd.Series, model: AgglomerativeClustering)
+            (labels: pd.Series, model: AgglomerativeClustering, cut_labels: pd.Series | None)
         """
         # --- подготовка данных ---
         X = self.df[features].dropna()
         num_cols = [c for c in X.columns if pd.api.types.is_numeric_dtype(X[c])]
+
         if not num_cols:
             raise ValueError("Нужны числовые признаки для кластеризации.")
         if len(num_cols) < len(X.columns):
@@ -501,7 +659,7 @@ class Dataset():
         if standardize:
             X_values = StandardScaler().fit_transform(X_values)
 
-        # --- модель ---
+        # --- модель (sklearn) ---
         effective_metric = "euclidean" if linkage == "ward" else metric
         model = AgglomerativeClustering(
             n_clusters=None if distance_threshold is not None else n_clusters,
@@ -513,7 +671,7 @@ class Dataset():
 
         labels = pd.Series(model.labels_, index=X.index, name="cluster")
 
-        # --- запись меток в df ---
+        # --- запись меток sklearn-кластера в df ---
         if label_column is None:
             suffix = (
                 f"thr_{distance_threshold}"
@@ -521,23 +679,210 @@ class Dataset():
                 else f"{n_clusters}"
             )
             label_column = f"hclust_{linkage}_{suffix}"
+
+        self.df[label_column] = pd.Series(index=self.df.index, dtype="Int64")
+        self.df.loc[labels.index, label_column] = labels.values
+
+        # --- SciPy linkage (для дендрограммы + cut_distance) ---
+        cut_labels = None      # то, чем вернём кластеры на уровне cut_distance
+
+        if plot or (cut_distance is not None):
+            Z = sch.linkage(X_values, method=linkage, metric=effective_metric)
+
+            # дендрограмма
+            if plot:
+                plt.figure(figsize=(10, 5))
+                sch.dendrogram(Z, no_labels=True)
+                if distance_threshold is not None:
+                    # горизонтальная линия на уровне distance_threshold (если захочешь)
+                    plt.axhline(y=distance_threshold, linestyle="--")
+                if cut_distance is not None:
+                    # горизонтальная линия на уровне cut_distance
+                    plt.axhline(y=cut_distance, linestyle=":", linewidth=1)
+                plt.title("Hierarchical clustering dendrogram")
+                plt.xlabel("Objects")
+                plt.ylabel("Distance")
+                if savefig_path:
+                    plt.tight_layout()
+                    plt.savefig(savefig_path, dpi=150)
+                plt.show()
+
+            # --- кластеры на уровне cut_distance ---
+            if cut_distance is not None:
+                flat_clusters = sch.fcluster(
+                    Z,
+                    t=cut_distance,
+                    criterion="distance"
+                )
+                cut_labels = pd.Series(
+                    flat_clusters,
+                    index=X.index,
+                    name=f"cluster_d{cut_distance:g}",
+                )
+
+                if cut_label_column is None:
+                    cut_label_column = f"hclust_{linkage}_cut_{cut_distance:g}"
+
+                self.df[cut_label_column] = pd.Series(index=self.df.index, dtype="Int64")
+                self.df.loc[cut_labels.index, cut_label_column] = cut_labels.values
+
+        return labels, model, cut_labels
+
+
+    def hierarchical_clustering_all_features(
+        self,
+        features: list[str],
+        n_clusters: int = 4,
+        *,
+        linkage: str = "ward",         # "ward" | "complete" | "average" | "single"
+        metric: str = "euclidean",     # для "ward" всегда euclidean
+        standardize: bool = True,
+        label_column: str | None = None,
+        plot: bool = True,
+        savefig_path: str | None = None,
+        top_categories: int = 3,       # сколько самых частых значений по категориальным выводить
+    ):
+        """
+        Иерархическая кластеризация по ВСЕМ указанным признакам (числовым и категориальным).
+
+        Шаги:
+        1. Делим признаки на числовые и категориальные.
+        2. Числовые (опционально) стандартизируем, категориальные -> OneHotEncoder.
+        3. Делаем AgglomerativeClustering по преобразованным данным.
+        4. Строим дендрограмму по тем же преобразованным данным.
+        5. Для n_clusters (по умолчанию 4) выводим сводку по исходным признакам.
+
+        Результат:
+        labels: pd.Series с номерами кластеров
+        model : AgglomerativeClustering
+        summary: словарь с описанием кластеров
+        """
+
+        # --- подготовка данных ---
+        if not features:
+            raise ValueError("Список features пуст.")
+
+        X = self.df[features].dropna()
+        if X.empty:
+            raise ValueError("После dropna() не осталось строк для кластеризации.")
+
+        # Разделяем признаки на числовые и категориальные
+        num_cols = [c for c in X.columns if is_numeric_dtype(X[c])]
+        cat_cols = [c for c in X.columns if c not in num_cols]
+
+        if not num_cols and not cat_cols:
+            raise ValueError("Не удалось найти признаки для кластеризации.")
+
+        # Препроцессинг: числовые + категориальные
+        numeric_transformer = StandardScaler() if standardize and num_cols else "passthrough"
+        categorical_transformer = OneHotEncoder(
+            handle_unknown="ignore",
+            sparse_output=False,   # важно: нужен плотный массив для scipy.linkage
+        ) if cat_cols else "passthrough"
+
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ("num", numeric_transformer, num_cols),
+                ("cat", categorical_transformer, cat_cols),
+            ],
+            remainder="drop",
+        )
+
+        # Преобразуем данные
+        X_trans = preprocessor.fit_transform(X)
+
+        # --- модель ---
+        effective_metric = "euclidean" if linkage == "ward" else metric
+
+        model = AgglomerativeClustering(
+            n_clusters=n_clusters,
+            linkage=linkage,
+            metric=effective_metric,
+        ).fit(X_trans)
+
+        labels = pd.Series(model.labels_, index=X.index, name="cluster")
+
+        # --- запись меток в df ---
+        if label_column is None:
+            label_column = f"hclust_all_{linkage}_{n_clusters}"
         self.df[label_column] = pd.Series(index=self.df.index, dtype="Int64")
         self.df.loc[labels.index, label_column] = labels.values
 
         # --- визуализация (дендрограмма) ---
         if plot:
-            Z = sch.linkage(X_values, method=linkage, metric=effective_metric)
-            plt.figure(figsize=(10, 5))
+            # linkage требует на вход уже числовой массив
+            Z = sch.linkage(X_trans, method=linkage, metric=effective_metric)
+
+            plt.figure(figsize=(12, 5))
             sch.dendrogram(Z, no_labels=True)
-            plt.title("Hierarchical clustering dendrogram")
+            plt.title(f"Hierarchical clustering dendrogram ({n_clusters} clusters)")
             plt.xlabel("Objects")
             plt.ylabel("Distance")
+
+            # Примерно показим уровень, соответствующий 4 кластерам
+            # (для общего понимания, не идеально, но наглядно)
+            try:
+                # Высота слияния, оставляющая n_clusters кластеров:
+                # берём расстояние (колонка 2) на шаге, когда остаётся n_clusters
+                # В Z shape = (n_samples-1, 4). Берём элемент с индексом -n_clusters.
+                threshold = Z[-n_clusters, 2]
+                plt.axhline(y=threshold, linestyle="--")
+            except Exception:
+                pass
+
             if savefig_path:
                 plt.tight_layout()
                 plt.savefig(savefig_path, dpi=150)
             plt.show()
 
-        return labels, model
+        # --- описание кластеров в ИСХОДНЫХ признаках (а не в OneHot/StandardScaler) ---
+        X_with_labels = X.copy()
+        X_with_labels["cluster"] = labels
+
+        summary: dict[int, dict] = {}
+
+        for cl in sorted(labels.unique()):
+            group = X_with_labels[X_with_labels["cluster"] == cl].drop(columns=["cluster"])
+            size = len(group)
+
+            print(f"\n=== Кластер {cl} (n={size}) ===")
+
+            cluster_info: dict[str, dict] = {
+                "size": size,
+                "numeric": {},
+                "categorical": {},
+            }
+
+            # Числовые признаки: базовая статистика
+            if num_cols:
+                print("\nЧИСЛОВЫЕ ПРИЗНАКИ (describe):")
+                desc = group[num_cols].describe().T
+                print(desc)
+
+                for col in num_cols:
+                    cluster_info["numeric"][col] = {
+                        "mean": group[col].mean(),
+                        "std": group[col].std(),
+                        "min": group[col].min(),
+                        "max": group[col].max(),
+                    }
+
+            # Категориальные признаки: топ значений
+            if cat_cols:
+                print("\nКАТЕГОРИАЛЬНЫЕ ПРИЗНАКИ (top значения):")
+                for col in cat_cols:
+                    vc = group[col].value_counts(dropna=False)
+                    top = vc.head(top_categories)
+                    print(f"\n{col}:")
+                    print(top)
+
+                    cluster_info["categorical"][col] = top.to_dict()
+
+            summary[int(cl)] = cluster_info
+
+        return labels, model, summary
+
+
     
     
     def add_feature_ranking(self, target):
@@ -658,8 +1003,192 @@ class Dataset():
 
         return pd.DataFrame(results)
 
+
+    def add_feature_ranking_global(self):
+
+        features = list(self.df.columns)
+        agg = {}
+        for tgt in features:
+            try:
+                rank = self.add_feature_ranking(tgt)
+            except Exception:
+                continue
+            if rank is None or len(rank) == 0:
+                continue
+            r = rank.copy()
+            r["delta"] = r["delta"].fillna(0.0)
+            for _, row in r.iterrows():
+                f = row["feature"]
+                d = float(row["delta"]) if pd.notnull(row["delta"]) else 0.0
+                st = int(row["step"]) if pd.notnull(row["step"]) else 0
+                if f not in agg:
+                    agg[f] = {"sum_delta_pos": 0.0, "sum_delta": 0.0, "count": 0, "count_pos": 0, "steps": []}
+                agg[f]["sum_delta"] += d
+                agg[f]["count"] += 1
+                if d > 0:
+                    agg[f]["sum_delta_pos"] += d
+                    agg[f]["count_pos"] += 1
+                agg[f]["steps"].append(st)
+        rows = []
+        for f, s in agg.items():
+            rows.append({
+                "feature": f,
+                "targets_covered": s["count"],
+                "used_with_gain": s["count_pos"],
+                "mean_delta": (s["sum_delta"] / s["count"]) if s["count"] else 0.0,
+                "mean_delta_pos": (s["sum_delta_pos"] / s["count_pos"]) if s["count_pos"] else 0.0,
+                "sum_delta_pos": s["sum_delta_pos"],
+                "median_step": float(np.median(s["steps"])) if s["steps"] else np.nan,
+            })
+        out = pd.DataFrame(rows)
+        if out.empty:
+            return out
+        out = out.sort_values(["sum_delta_pos", "mean_delta_pos", "used_with_gain"], ascending=[False, False, False]).reset_index(drop=True)
+        return out
+    
+    
+    def hierarchical_clustering_all_features_ordinal(
+        self,
+        features: list[str],
+        n_clusters: int = 4,
+        *,
+        linkage: str = "ward",         # "ward" | "complete" | "average" | "single"
+        metric: str = "euclidean",     # для "ward" всегда euclidean
+        standardize: bool = True,
+        label_column: str | None = None,
+        plot: bool = True,
+        savefig_path: str | None = None,
+        top_categories: int = 3,       # сколько самых частых значений по категориальным выводить
+    ):
+        """
+        Иерархическая кластеризация по ВСЕМ признакам:
+        - числовые остаются как есть (можно стандартизировать)
+        - категориальные кодируются целыми числами (ordinal encoding)
+
+        Кластеризация идёт по числовой матрице, а для интерпретации
+        используются исходные строковые значения.
+        """
+
+        if not features:
+            raise ValueError("Список features пуст.")
+
+        # Берём только непустые строки
+        X = self.df[features].dropna()
+        if X.empty:
+            raise ValueError("После dropna() не осталось строк для кластеризации.")
+
+        # Разделяем признаки на числовые и категориальные
+        num_cols = [c for c in X.columns if is_numeric_dtype(X[c])]
+        cat_cols = [c for c in X.columns if c not in num_cols]
+
+        if not num_cols and not cat_cols:
+            raise ValueError("Не найдено признаков для кластеризации.")
+
+        # --- КОДИРОВАНИЕ КАТЕГОРИАЛЬНЫХ В ЧИСЛА ---
+        X_enc = X.copy()
+        encoding_maps: dict[str, dict[int, object]] = {}  # col -> {code: original_value}
+
+        for col in cat_cols:
+            # factorize даёт код (0..k-1) и массив уникальных значений
+            codes, uniques = pd.factorize(X[col], sort=True)
+            X_enc[col] = codes.astype(float)   # float, чтобы нормально работал StandardScaler
+            encoding_maps[col] = dict(enumerate(uniques))
+
+        # --- МАССИВ ДЛЯ КЛАСТЕРИЗАЦИИ ---
+        use_cols = num_cols + cat_cols
+        X_values = X_enc[use_cols].values
+
+        if standardize:
+            scaler = StandardScaler()
+            X_values = scaler.fit_transform(X_values)
+
+        # --- МОДЕЛЬ ---
+        effective_metric = "euclidean" if linkage == "ward" else metric
+
+        model = AgglomerativeClustering(
+            n_clusters=n_clusters,
+            linkage=linkage,
+            metric=effective_metric,
+        ).fit(X_values)
+
+        labels = pd.Series(model.labels_, index=X.index, name="cluster")
+
+        # --- ЗАПИСЬ МЕТОК В df ---
+        if label_column is None:
+            label_column = f"hclust_ord_{linkage}_{n_clusters}"
+
+        self.df[label_column] = pd.Series(index=self.df.index, dtype="Int64")
+        self.df.loc[labels.index, label_column] = labels.values
+
+        # --- ДЕНДРОГРАММА (ОСТОРОЖНО: O(n^2) ПО СТРОКАМ) ---
+        if plot:
+            Z = sch.linkage(X_values, method=linkage, metric=effective_metric)
+
+            plt.figure(figsize=(12, 5))
+            sch.dendrogram(Z, no_labels=True)
+            plt.title(f"Hierarchical clustering dendrogram ({n_clusters} clusters)")
+            plt.xlabel("Objects")
+            plt.ylabel("Distance")
+
+            # Примерный уровень для n_clusters
+            try:
+                threshold = Z[-n_clusters, 2]
+                plt.axhline(y=threshold, linestyle="--")
+            except Exception:
+                pass
+
+            if savefig_path:
+                plt.tight_layout()
+                plt.savefig(savefig_path, dpi=150)
+            plt.show()
+
+        # --- ОПИСАНИЕ КЛАСТЕРОВ В ИСХОДНЫХ ПРИЗНАКАХ ---
+        X_with_labels = X.copy()  # ИСХОДНЫЕ значения (строки, числа)
+        X_with_labels["cluster"] = labels
+
+        summary: dict[int, dict] = {}
+
+        for cl in sorted(labels.unique()):
+            group = X_with_labels[X_with_labels["cluster"] == cl].drop(columns=["cluster"])
+            size = len(group)
+
+            print(f"\n=== Кластер {cl} (n={size}) ===")
+
+            cluster_info: dict[str, dict] = {
+                "size": size,
+                "numeric": {},
+                "categorical": {},
+            }
             
-        
+            # Числовые признаки
+            if num_cols:
+                print("\nЧИСЛОВЫЕ ПРИЗНАКИ (describe):")
+                desc = group[num_cols].describe().T
+                print(desc)
+
+                for col in num_cols:
+                    cluster_info["numeric"][col] = {
+                        "mean": group[col].mean(),
+                        "std": group[col].std(),
+                        "min": group[col].min(),
+                        "max": group[col].max(),
+                    }
+
+            # Категориальные признаки
+            if cat_cols:
+                print("\nКАТЕГОРИАЛЬНЫЕ ПРИЗНАКИ (top значения):")
+                for col in cat_cols:
+                    vc = group[col].value_counts(dropna=False)
+                    top = vc.head(top_categories)
+                    print(f"\n{col}:")
+                    print(top)
+
+                    cluster_info["categorical"][col] = top.to_dict()
+
+            summary[int(cl)] = cluster_info
+
+        # encoding_maps тут на всякий случай — вдруг захочешь явно смотреть коды
+        return labels, model, summary, encoding_maps
 
 
 # ============================================
@@ -678,7 +1207,7 @@ def create_data_with_gaps(data: dict[str, Dataset], percents: list[float]):
         deleted_large.to_excel(f"{DELETED_LARGE_PATH}/{int(p*100)}.xlsx", index=False)
         
         
-def recover_data_groups():
+def recover_data():
     data = {
         "small": [(Dataset(f"out/data_with_gaps/small/{int(p*100)}.xlsx"), int(p*100)) for p in PERCENTS_OF_GAPS],
         "medium": [(Dataset(f"out/data_with_gaps/medium/{int(p*100)}.xlsx"), int(p*100)) for p in PERCENTS_OF_GAPS],
@@ -702,7 +1231,7 @@ def clustering_ward():
     data = Dataset("out/recovered_groups/small/3.xlsx")
     
     labels, model = data.hierarchical_clustering(
-        features=["store_name", "date-time", "coordinates", "coordinates", "brands", "price", "cards_number", "number_of_products", "receipt_id", "total_cost"],
+        features=["store_name", "date-time", "coordinates", "brands", "price", "cards_number", "number_of_products", "receipt_id", "total_cost"],
         n_clusters=3,          # или distance_threshold=..., тогда n_clusters игнорируется
         linkage="ward",        # "ward" | "complete" | "average" | "single"
         metric="euclidean",    # для non-ward можно задать, напр. "cosine"
@@ -713,11 +1242,11 @@ def clustering_ward():
     )
     
     
-def clustering_euclidian():
+def clustering_chebyshev():
     data = Dataset("out/recovered_groups/small/3.xlsx")
     
     labels, model = data.hierarchical_clustering(
-        features=["store_name", "date-time", "coordinates", "coordinates", "brands", "price", "cards_number", "number_of_products", "receipt_id", "total_cost"],
+        features=["store_name", "date-time", "coordinates", "brands", "price", "cards_number", "number_of_products", "receipt_id", "total_cost"],
         n_clusters=3,          # или distance_threshold=..., тогда n_clusters игнорируется
         linkage="complete",        # "ward" | "complete" | "average" | "single"
         metric="chebyshev",    # для non-ward можно задать, напр. "cosine"
@@ -726,6 +1255,80 @@ def clustering_euclidian():
         plot=True,
         savefig_path=None,
     )
+    
+    
+def cluster_ward():
+    data = Dataset(SMALL_PATH)
+    
+    labels, model, summary, enc_maps = data.hierarchical_clustering_all_features_ordinal(
+        features=["store_name", "date-time", "coordinates","categories", "brands", "price", "cards_number", "number_of_products", "receipt_id", "total_cost"],              # список колонок
+        n_clusters=4,
+        linkage="ward",
+        standardize=True,
+        plot=False,                  # ВАЖНО: без дендограммы
+    )
+
+
+        
+        
+def cluster_chebyshev():
+    data = Dataset(SMALL_PATH)
+    
+    labels, model, summary, enc_maps = data.hierarchical_clustering_all_features_ordinal(
+        features=["store_name", "date-time", "coordinates","categories", "brands", "price", "cards_number", "number_of_products", "receipt_id", "total_cost"],              # список колонок
+        n_clusters=4,
+        linkage="complete",        # "ward" | "complete" | "average" | "single"
+        metric="chebyshev",
+        standardize=True,
+        plot=False,                  # ВАЖНО: без дендограммы
+    )
+
+
+    
+    
+def Add_method():
+    data = Dataset(SMALL_PATH)
+    
+    rank = data.add_feature_ranking(target="receipt_id")
+    
+    print(rank)
+    
+    
+def inf_cluster_ward():
+    data = Dataset(SMALL_PATH)
+    
+    labels, model, summary, enc_maps = data.hierarchical_clustering_all_features_ordinal(
+        features=["store_name", "brands", "price", "cards_number", "total_cost"],              # список колонок
+        n_clusters=4,
+        linkage="ward",
+        standardize=True,
+        plot=True,                  # ВАЖНО: без дендограммы
+    )
+    
+    
+def inf_cluster_chebyshev(path):
+    data = Dataset(path)
+    
+    labels, model, summary, enc_maps = data.hierarchical_clustering_all_features_ordinal(
+        features=["store_name", "brands", "price", "cards_number", "total_cost"],              # список колонок
+        n_clusters=4,
+        linkage="complete",        # "ward" | "complete" | "average" | "single"
+        metric="chebyshev",
+        standardize=True,
+        plot=True,                  # ВАЖНО: без дендограммы
+    )
+    
+    
+def inf_cluster_ward_recovered(path):
+    data = Dataset(path)
+    
+    labels, model, summary, enc_maps = data.hierarchical_clustering_all_features_ordinal(
+        features=["store_name", "brands", "price", "cards_number", "total_cost"],              # список колонок
+        n_clusters=4,
+        linkage="ward",
+        standardize=True,
+        plot=True,                  # ВАЖНО: без дендограммы
+    )
         
         
 # ============================================
@@ -733,15 +1336,17 @@ def clustering_euclidian():
 # ============================================
 
 
-# data = {
-#     "small": Dataset(SMALL_PATH),
+data = {
+    "small": Dataset(SMALL_PATH),
 #     "medium": Dataset(MEDIUM_PATH),
 #     "large": Dataset(LARGE_PATH),
-# }
+}
 
 if __name__ == "__main__":
-    data = Dataset("out/recovered_groups/small/3.xlsx")
+    # print("Feature, informativity")
+    # print("store_name         0.76")
+    # print("coordinates        0.71")
+    # print("categories         0.65")
+    # print("")
     
-    rank = data.add_feature_ranking("categories")
-    
-    print(rank)
+    Add_method()
